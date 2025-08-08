@@ -24,6 +24,7 @@ from support_functions import fix_1c_excel_case, normalize_path, validate_paths,
 from custom_errors import NoExcelFilesFoundError, RegisterProcessingError, NoRegisterFilesFoundError, IncorrectFolderOrFilesPath
 
 init(autoreset=True)
+pd.set_option('future.no_silent_downcasting', True)
 
 
 class FileProcessor(ABC):
@@ -76,7 +77,7 @@ class UPPFileProcessor(FileProcessor):
         # Преобразование даты (векторизовано)
         # df['Дата'] = pd.to_datetime(df['Дата'], format='%d.%m.%Y', errors='coerce')
         df['Дата'] = pd.to_datetime(df['Дата'], dayfirst=True, errors='coerce')
-
+        
         
         # Добавляем порядковый номер к повторяющимся значениям
         mask = df['Документ'].notna()
@@ -85,6 +86,7 @@ class UPPFileProcessor(FileProcessor):
             + '_end' 
             + df.loc[mask].groupby('Документ').cumcount().add(1).astype(str)
         )
+        
 
         # Заполнение пропусков (ffill) и удаление пустых строк
 
@@ -106,30 +108,101 @@ class UPPFileProcessor(FileProcessor):
         # Реализация обработки для УПП
         
         fixed_data = fix_1c_excel_case(file_path)
+        
         df = pd.read_excel(fixed_data, header=None)
         df = df.dropna(axis=1, how='all')
+        
 
         # Обработка DataFrame
         df = UPPFileProcessor._process_dataframe_optimized(df)
         
+        # Отработка столбцов с количеством
+        df_with_count = pd.DataFrame()
+        if (df['Содержание'] == 'Количество').any():
+            df_with_count = df[df['Содержание']=='Количество']
+            df_with_count = df_with_count.dropna(axis=1, how='all')
+            
+            # Получаем индексы столбцов 'Дт' и 'Кт'
+            dt_index = df_with_count.columns.get_loc('Дт')
+            kt_index = df_with_count.columns.get_loc('Кт')
+            
+            # Преобразуем столбцы в числовые, некорректные значения станут NaN
+            dt_col = pd.to_numeric(df_with_count.iloc[:, dt_index], errors='coerce')
+            dt_next_col = pd.to_numeric(df_with_count.iloc[:, dt_index + 1], errors='coerce')
+            
+            kt_col = pd.to_numeric(df_with_count.iloc[:, kt_index], errors='coerce')
+            kt_next_col = pd.to_numeric(df_with_count.iloc[:, kt_index + 1], errors='coerce')
+            
+            # Суммируем, игнорируя NaN (если хотите считать NaN как 0, можно заменить их)
+            df_with_count['Дт_количество'] = dt_col.fillna(0) + dt_next_col.fillna(0)
+            df_with_count['Кт_количество'] = kt_col.fillna(0) + kt_next_col.fillna(0)
+            df_with_count = df_with_count[['Документ', 'Дт_количество', 'Кт_количество']].copy()
+    
         
+        # Удаляем строки с количеством
+        df = df[df['Содержание'] != 'Количество']
+        
+        # Отработка столбцов с валютой
+        df_with_currency = pd.DataFrame()
+        if (df['Содержание'] == 'Валюта').any():
+            df_with_currency = df[df['Содержание']=='Валюта']
+            df_with_currency = df_with_currency.dropna(axis=1, how='all')
+            
+            
+            # Получаем индексы столбцов 'Дт' и 'Кт'
+            dt_index = df_with_currency.columns.get_loc('Дт')
+            kt_index = df_with_currency.columns.get_loc('Кт')
+            
+
+            # Комплексная замена всех видов "пустых" значений на NaN
+            df_with_currency.replace(
+                [np.nan, '\n', '\t', ' '],  # Явные замены
+                '',
+                inplace=True,
+            )
+
+            df_with_currency.replace(
+                r'^\s+$',  # Регулярное выражение для строк из любых пробельных символов
+                '',
+                inplace=True,
+                regex=True
+            )
+            df_with_currency['Дт_валюта'] = df_with_currency['Дт'] + df_with_currency.iloc[:, dt_index + 1]
+            df_with_currency['Кт_валюта'] = df_with_currency['Кт'] + df_with_currency.iloc[:, kt_index + 1]
+            df_with_currency = df_with_currency[['Документ', 'Дт_валюта', 'Кт_валюта']].copy()
+            
+
+            
+            
+    
+        
+        # Удаляем строки с количеством
+        df = df[df['Содержание'] != 'Валюта']
+        
+        
+
         if df.empty:
             raise RegisterProcessingError(Fore.RED + f"Отчет по проводкам 1с пустой в файле {file_path.name}, обработка невозможна.\n")
 
         # Оптимизированный pivot (без медленного apply)
         
+        df = df.fillna({
+                                'Содержание': '',
+                                'Субконто Дт': '',
+                                'Субконто Кт': ''
+                            })
+        
         operations_pivot = (
             df.assign(row_num=df.groupby(['Дата', 'Документ']).cumcount() + 1)
-            .pivot_table(index=['Дата', 'Документ'], columns='row_num', values=['Содержание', 'Субконто Дт', 'Субконто Кт'], aggfunc='first')
+            .pivot_table(index=['Дата', 'Документ'], columns='row_num', values=['Содержание', 'Субконто Дт', 'Субконто Кт'], aggfunc='first', fill_value='')
             .reset_index()
             # .rename(columns=lambda x: f'Содержание_{x}' if isinstance(x, int) else x)
         )
-        
-        
+
 
         operations_pivot = UPPFileProcessor._fast_keep_first_unique_per_row(operations_pivot)
         operations_pivot = operations_pivot.dropna(how='all', axis=0).dropna(how='all', axis=1)
-        
+
         
         # Проверяем, является ли столбец многоуровневым
         operations_pivot.columns = [
@@ -146,16 +219,32 @@ class UPPFileProcessor(FileProcessor):
             .set_index('Документ')
             .drop(columns=['Дата', 'Субконто Дт', 'Субконто Кт'])
         )
-        
+
 
         # Слияние через join (быстрее merge для индексированных данных)
-        result: pd.DataFrame = doc_attributes.join(operations_pivot.set_index('Документ'), how='left').reset_index()
+        # result: pd.DataFrame = doc_attributes.join(operations_pivot.set_index('Документ'), how='left').reset_index()
+        
+        if not df_with_count.empty and not df_with_currency.empty:
+            result: pd.DataFrame = doc_attributes.join(operations_pivot.set_index('Документ'), how='left')
+            result = result.join(df_with_count.set_index('Документ'), how='left')
+            result = result.join(df_with_currency.set_index('Документ'), how='left').reset_index()
+        elif not df_with_count.empty:
+            result: pd.DataFrame = doc_attributes.join(operations_pivot.set_index('Документ'), how='left')
+            result = result.join(df_with_count.set_index('Документ'), how='left').reset_index()
+        elif not df_with_currency.empty:
+            result: pd.DataFrame = doc_attributes.join(operations_pivot.set_index('Документ'), how='left')
+            result = result.join(df_with_currency.set_index('Документ'), how='left').reset_index()
+        else:
+            result: pd.DataFrame = doc_attributes.join(operations_pivot.set_index('Документ'), how='left').reset_index()
+        
 
         # Финальная очистка
         result = result.dropna(subset=['Дт', 'Кт'], how='all')
         result['Документ'] = result['Документ'].str.replace(r'_end\d+$', '', regex=True)
         result = result.dropna(how='all', axis=0).dropna(how='all', axis=1)
+        
 
+        
         new_columns = []
         cols = result.columns.tolist()
         for i, col in enumerate(cols):
@@ -172,7 +261,8 @@ class UPPFileProcessor(FileProcessor):
 
         result.columns = new_columns
 
-        # updated_cols = result.columns.tolist()
+        updated_cols = result.columns.tolist()
+        
         updated_cols = list(result.columns)  # Заменили .tolist() на list()
         updated_cols.insert(0, updated_cols.pop(updated_cols.index('Дата')))
         result = result[updated_cols]
@@ -180,6 +270,26 @@ class UPPFileProcessor(FileProcessor):
         result['Имя_файла'] = os.path.basename(file_path)
         updated_cols = ['Имя_файла'] + [col for col in result.columns if col != 'Имя_файла']
         result = result[updated_cols]
+        
+
+        # Комплексная замена всех видов "пустых" значений на NaN
+        result.replace(
+            ['', '\n', '\t', ' '],  # Явные замены
+            np.nan,
+            inplace=True,
+        )
+
+        result.replace(
+            r'^\s+$',  # Регулярное выражение для строк из любых пробельных символов
+            np.nan,
+            inplace=True,
+            regex=True
+        )
+
+
+        # Удаление полностью пустых строк и столбцов
+        result.dropna(how='all', axis=0, inplace=True)
+        result.dropna(how='all', axis=1, inplace=True)
         
         return result
 
@@ -212,10 +322,48 @@ class NonUPPFileProcessor(FileProcessor):
         header_row = index[0]
         df.columns = df.iloc[header_row]
         df = df.iloc[header_row + 1:].reset_index(drop=True)
+        
+        
+        df_with_col=pd.DataFrame()
+        # Найдем столбец, название которого начинается с "Показ"
+        matching_columns = [col for col in df.columns if str(col).startswith('Показ')]
+        if matching_columns:  # Если такой столбец есть
+            col_name = matching_columns[0]  # Берём первый подходящий
+
+            df_with_col = df[df[col_name]=='Кол.']
+            df_with_col = df_with_col.dropna(axis=1, how='all')
+            
+            # Получаем индексы столбцов 'Дт' и 'Кт'
+            dt_index = df_with_col.columns.get_loc('Дебет')
+            kt_index = df_with_col.columns.get_loc('Кредит')
+            
+            # Преобразуем столбцы в числовые, некорректные значения станут NaN
+            # dt_col = pd.to_numeric(df_with_col.iloc[:, dt_index], errors='coerce')
+            dt_next_col = pd.to_numeric(df_with_col.iloc[:, dt_index + 1], errors='coerce')
+            
+            # kt_col = pd.to_numeric(df_with_col.iloc[:, kt_index], errors='coerce')
+            kt_next_col = pd.to_numeric(df_with_col.iloc[:, kt_index + 1], errors='coerce')
+            
+            # Суммируем, игнорируя NaN (если хотите считать NaN как 0, можно заменить их)
+            df_with_col['Дебет_количество'] = dt_next_col.fillna(0)
+            df_with_col['Кредит_количество'] = kt_next_col.fillna(0)
+            df_with_col = df_with_col[['Дебет_количество', 'Кредит_количество']].copy()
+            df_with_col = df_with_col.iloc[:-1]
+
+
+        
+        
+        
 
         # Фильтрация по дате
         dates = pd.to_datetime(df['Период'], format='%d.%m.%Y', errors='coerce')
         df = df.loc[dates.notna()].copy().reset_index(drop=True)
+        
+        if not df_with_col.empty and df_with_col.shape[0] == df.shape[0]:
+            df.reset_index(drop=True, inplace=True)
+            df_with_col.reset_index(drop=True, inplace=True)
+            df = pd.concat([df, df_with_col], axis=1)
+
 
         # Разбиваем столбцы с \n
         self._split_and_expand(df, 'Документ', 'Документ')
@@ -517,8 +665,8 @@ def main():
                     continue
                 except Exception as e:
                     print(f'{e}')
-                    # import traceback
-                    # traceback.print_exc()
+                    import traceback
+                    traceback.print_exc()
                     if input_path.is_file():
                         file_handler.not_correct_files.append(input_path.name)
                     continue
@@ -532,7 +680,7 @@ def main():
             # traceback.print_exc()
         finally:
             if file_handler.not_correct_files:
-                print(Fore.RED + 'Нижеследующие файлы .xlsx не распознаны как Отчеты по проводкам 1С:                 \n', end='\r')
+                print(Fore.RED + 'Нижеследующие файлы .xlsx не удалось корректно обработать:                 \n', end='\r')
                 for i in file_handler.not_correct_files:
                     print(Fore.RED + f'    {i}')
                 file_handler.not_correct_files.clear()
